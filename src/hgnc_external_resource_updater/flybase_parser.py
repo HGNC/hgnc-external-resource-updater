@@ -6,6 +6,7 @@ models, then normalizes them into domain ExternalResource entities.
 
 from __future__ import annotations
 
+import gzip
 import logging
 
 from hgnc_external_resource_updater.exceptions import ParseError
@@ -13,6 +14,57 @@ from hgnc_external_resource_updater.flybase_models import FlyBaseRawRecord
 from hgnc_external_resource_updater.models import ExternalResource
 
 logger = logging.getLogger(__name__)
+
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
+class FlyBaseDecompressor:
+    """Decompress FlyBase feed data with double-gzip detection.
+
+    Checks for gzip magic bytes at the start of data. If present,
+    decompresses once and checks again for double-gzip. Returns
+    UTF-8 decoded text.
+    """
+
+    @staticmethod
+    def is_gzip(data: bytes) -> bool:
+        """Check whether data starts with gzip magic bytes.
+
+        Args:
+            data: The raw bytes to inspect.
+
+        Returns:
+            True if the first two bytes are ``0x1f 0x8b``.
+        """
+        return len(data) >= 2 and data[:2] == _GZIP_MAGIC
+
+    @staticmethod
+    def decompress(data: bytes) -> str:
+        """Decompress data, handling single or double gzip.
+
+        Args:
+            data: Raw bytes that may be gzip-compressed (once or twice)
+                or plain text.
+
+        Returns:
+            The decompressed UTF-8 string.
+
+        Raises:
+            Exception: If gzip decompression fails on invalid data.
+        """
+        if not data:
+            return ""
+
+        if not FlyBaseDecompressor.is_gzip(data):
+            return data.decode("utf-8")
+
+        first_pass = gzip.decompress(data)
+
+        if FlyBaseDecompressor.is_gzip(first_pass):
+            second_pass = gzip.decompress(first_pass)
+            return second_pass.decode("utf-8")
+
+        return first_pass.decode("utf-8")
 
 
 class FlyBaseParser:
