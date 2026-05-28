@@ -1,21 +1,30 @@
-"""FlyBase feed parser and normalizer.
+"""FlyBase feed parser, decompressor, and normalizer.
 
-Parses raw TSV content from FlyBase group feeds into FlyBaseRawRecord
-models, then normalizes them into domain ExternalResource entities.
+Parses raw TSV content from FlyBase gene group feeds into FlyBaseRecord
+models, handles double-gzip decompression, and normalizes records into
+ExternalResource entities matching the actual genew4 schema.
 """
 
 from __future__ import annotations
 
 import gzip
 import logging
+import re
 
 from hgnc_external_resource_updater.exceptions import ParseError
-from hgnc_external_resource_updater.flybase_models import FlyBaseRawRecord
-from hgnc_external_resource_updater.models import ExternalResource
+from hgnc_external_resource_updater.models import (
+    ExternalResource,
+    FamilyLink,
+    FlyBaseRecord,
+)
 
 logger = logging.getLogger(__name__)
 
 _GZIP_MAGIC = b"\x1f\x8b"
+
+_HGNC_ID_FIX: dict[int, int] = {
+    19082: 283,
+}
 
 
 class FlyBaseDecompressor:
@@ -70,17 +79,20 @@ class FlyBaseDecompressor:
 class FlyBaseParser:
     """Parse raw FlyBase TSV feed content into structured records.
 
-    Handles malformed rows by logging a warning and skipping them.
+    Handles header skipping, malformed rows, and the HGNC ID
+    correction (19082 → 283).
     """
 
-    def parse(self, raw: str) -> list[FlyBaseRawRecord]:
-        """Parse raw TSV content into a list of FlyBaseRawRecord models.
+    HEADER_LINES = 9
+
+    def parse(self, raw: str) -> list[FlyBaseRecord]:
+        """Parse raw TSV content into a list of FlyBaseRecord models.
 
         Args:
-            raw: The raw TSV content from the FlyBase feed.
+            raw: The decompressed TSV content from the FlyBase feed.
 
         Returns:
-            A list of validated FlyBaseRawRecord instances.
+            A list of validated FlyBaseRecord instances.
 
         Raises:
             ParseError: If the feed is empty or entirely unparseable.
@@ -88,29 +100,35 @@ class FlyBaseParser:
         if not raw or not raw.strip():
             raise ParseError("FlyBase feed is empty")
 
-        records: list[FlyBaseRawRecord] = []
+        records: list[FlyBaseRecord] = []
         skipped = 0
 
         for line_no, line in enumerate(raw.strip().splitlines(), start=1):
+            if line_no <= self.HEADER_LINES:
+                continue
+
             line = line.strip()
             if not line:
                 continue
 
             parts = line.split("\t")
-            if len(parts) < 2:
+            if len(parts) < 4:
                 logger.warning("Skipping malformed row %d: %s", line_no, line)
                 skipped += 1
                 continue
 
             try:
-                record = FlyBaseRawRecord(
-                    flybase_id=parts[0],
-                    hgnc_id=parts[1],
-                    gene_symbol=parts[2] if len(parts) > 2 else "",
-                    url=parts[3] if len(parts) > 3 else "",
+                hgnc_id = int(parts[3].strip())
+                hgnc_id = _HGNC_ID_FIX.get(hgnc_id, hgnc_id)
+                records.append(
+                    FlyBaseRecord(
+                        group_id=parts[0].strip(),
+                        symbol=parts[1].strip(),
+                        name=parts[2].strip(),
+                        family_id=hgnc_id,
+                    )
                 )
-                records.append(record)
-            except Exception:
+            except (ValueError, IndexError):
                 logger.warning("Skipping invalid row %d: %s", line_no, line)
                 skipped += 1
 
@@ -122,31 +140,29 @@ class FlyBaseParser:
         return records
 
 
-def normalize(raw: FlyBaseRawRecord) -> ExternalResource:
-    """Normalize a raw FlyBase record into a domain ExternalResource.
+def normalize_to_resource(record: FlyBaseRecord, ext_id: int) -> ExternalResource:
+    """Convert a FlyBaseRecord to an ExternalResource with constructed URL.
 
     Args:
-        raw: The raw FlyBase record.
+        record: The parsed FlyBase record.
+        ext_id: The external resource ID to assign.
 
     Returns:
-        A normalized ExternalResource domain entity.
+        An ExternalResource ready for persistence.
     """
-    return ExternalResource(
-        source_db="flybase",
-        resource_id=raw.flybase_id,
-        hgnc_id=raw.hgnc_id,
-        display_name=raw.gene_symbol,
-        url=raw.url,
-    )
+    url = f"http://flybase.org/reports/{record.group_id}.html"
+    name = f"FlyBase gene group: {record.name}"
+    return ExternalResource(ext_id=ext_id, name=name, url=url)
 
 
-def normalize_batch(records: list[FlyBaseRawRecord]) -> list[ExternalResource]:
-    """Normalize a batch of raw FlyBase records into domain entities.
+def normalize_to_link(record: FlyBaseRecord, ext_id: int) -> FamilyLink:
+    """Convert a FlyBaseRecord to a FamilyLink.
 
     Args:
-        records: The raw FlyBase records.
+        record: The parsed FlyBase record.
+        ext_id: The external resource ID to link.
 
     Returns:
-        A list of normalized ExternalResource domain entities.
+        A FamilyLink ready for persistence.
     """
-    return [normalize(r) for r in records]
+    return FamilyLink(family_id=record.family_id, ext_id=ext_id)

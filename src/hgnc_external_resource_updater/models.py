@@ -1,8 +1,8 @@
 """Domain models for FlyBase external resource sync.
 
-Defines Pydantic models for external_resource and
-family_has_external_resource records consumed by the sync service
-and repository layers.
+Defines data structures matching the actual genew4 schema used by
+the Perl updater: external_resource(id, name, url) and
+family_has_external_resource(family_id, ext_id).
 """
 
 from __future__ import annotations
@@ -10,33 +10,43 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
-class ExternalResource(BaseModel):
-    """Represent a single external_resource record from a FlyBase feed.
+class FlyBaseRecord(BaseModel):
+    """A parsed FlyBase gene group record.
 
     Attributes:
-        source_db: The external database source identifier (e.g. "flybase").
-        resource_id: The external resource's unique identifier (e.g. "FBgn0001234").
-        hgnc_id: The HGNC identifier linking this resource to a gene (e.g. "HGNC:12345").
-        display_name: Human-readable display name for the resource link.
+        group_id: FlyBase gene group identifier (e.g. FBgg00001).
+        symbol: Gene group symbol.
+        name: Gene group name.
+        family_id: HGNC gene family ID (HGNC ID for the group).
+    """
+
+    group_id: str = Field(min_length=1)
+    symbol: str = Field(default="")
+    name: str = Field(default="")
+    family_id: int = Field(gt=0)
+
+
+class ExternalResource(BaseModel):
+    """Represent a row in the external_resource table.
+
+    Attributes:
+        ext_id: The auto-incremented primary key.
+        name: Display name for the resource.
         url: URL to the external resource page.
     """
 
-    source_db: str = Field(min_length=1)
-    resource_id: str = Field(min_length=1)
-    hgnc_id: str = Field(min_length=1)
-    display_name: str = Field(default="")
-    url: str = Field(default="")
+    ext_id: int = Field(gt=0)
+    name: str = Field(min_length=1)
+    url: str = Field(min_length=1)
 
 
-class FamilyExternalResourceLink(BaseModel):
-    """Represent a family_has_external_resource link record.
+class FamilyLink(BaseModel):
+    """Represent a row in family_has_external_resource.
 
     Attributes:
-        hgnc_id: The HGNC identifier for the gene family.
-        resource_id: The external resource identifier being linked.
-        source_db: The external database source identifier.
+        family_id: HGNC gene family ID.
+        ext_id: External resource ID.
     """
 
-    hgnc_id: str = Field(min_length=1)
-    resource_id: str = Field(min_length=1)
-    source_db: str = Field(min_length=1)
+    family_id: int = Field(gt=0)
+    ext_id: int = Field(gt=0)

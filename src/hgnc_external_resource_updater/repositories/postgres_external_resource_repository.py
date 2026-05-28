@@ -1,60 +1,53 @@
 """Postgres repository for FlyBase external resource operations.
 
 Implements the ExternalResourceRepository ABC using psycopg v3
-with parameterized SQL for all operations.
+with parameterized SQL matching the actual genew4 schema.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from hgnc_external_resource_updater.exceptions import PersistenceError
-from hgnc_external_resource_updater.models import (
-    ExternalResource,
-    FamilyExternalResourceLink,
-)
 from hgnc_external_resource_updater.repositories.external_resource_repository import (
     ExternalResourceRepository,
 )
 
 logger = logging.getLogger(__name__)
 
-_SELECT_BY_SOURCE = (
-    "SELECT source_db, resource_id, hgnc_id, display_name, url "
-    "FROM external_resource WHERE source_db = %s"
-)
+_GET_MAX_ID = "SELECT COALESCE(MAX(id), 0) FROM external_resource"
 
-_UPSERT_RESOURCE = (
-    "INSERT INTO external_resource (source_db, resource_id, hgnc_id, display_name, url) "
-    "VALUES (%s, %s, %s, %s, %s) "
-    "ON CONFLICT (source_db, resource_id) DO UPDATE SET "
-    "hgnc_id = EXCLUDED.hgnc_id, "
-    "display_name = EXCLUDED.display_name, "
-    "url = EXCLUDED.url"
-)
+_FIND_BY_URL = "SELECT id FROM external_resource WHERE url = %s"
 
-_DELETE_RESOURCE = (
-    "DELETE FROM external_resource WHERE source_db = %s AND resource_id = ANY(%s)"
-)
+_UPDATE_NAME = "UPDATE external_resource SET name = %s WHERE id = %s"
 
-_UPSERT_FAMILY_LINK = (
-    "INSERT INTO family_has_external_resource (hgnc_id, resource_id, source_db) "
-    "VALUES (%s, %s, %s) "
-    "ON CONFLICT (hgnc_id, resource_id, source_db) DO NOTHING"
+_INSERT_RESOURCE = (
+    "INSERT INTO external_resource (id, name, url) VALUES (%s, %s, %s)"
 )
 
 _DELETE_FAMILY_LINKS = (
-    "DELETE FROM family_has_external_resource "
-    "WHERE source_db = %s AND resource_id = ANY(%s)"
+    "DELETE FROM family_has_external_resource WHERE ext_id = %s"
 )
+
+_INSERT_FAMILY_LINK = (
+    "INSERT INTO family_has_external_resource (family_id, ext_id) "
+    "VALUES (%s, %s)"
+)
+
+_GET_ALL_FLYBASE = (
+    "SELECT id, url FROM external_resource WHERE url LIKE '%flybase.org%'"
+)
+
+_DELETE_RESOURCE = "DELETE FROM external_resource WHERE id = %s"
 
 
 class PostgresExternalResourceRepository(ExternalResourceRepository):
     """Concrete Postgres repository for FlyBase external resource sync.
 
-    Uses psycopg v3 with parameterized SQL for all operations. Maps
-    database errors to PersistenceError for service-layer consumption.
+    Uses psycopg v3 with parameterized SQL. Maps database errors
+    to PersistenceError for service-layer consumption.
 
     Args:
         connection: A psycopg v3 connection instance.
@@ -63,75 +56,79 @@ class PostgresExternalResourceRepository(ExternalResourceRepository):
     def __init__(self, connection: Any) -> None:
         self._conn = connection
 
-    def get_existing_by_source(self, source_db: str) -> list[ExternalResource]:
+    def get_max_ext_id(self) -> int:
         try:
             with self._conn.cursor() as cur:
-                cur.execute(_SELECT_BY_SOURCE, (source_db,))
-                rows = cur.fetchall()
-                return [
-                    ExternalResource(
-                        source_db=row[0],
-                        resource_id=row[1],
-                        hgnc_id=row[2],
-                        display_name=row[3],
-                        url=row[4],
-                    )
-                    for row in rows
-                ]
+                cur.execute(_GET_MAX_ID)
+                row = cur.fetchone()
+                return row[0] if row else 0
         except Exception as exc:
             raise PersistenceError(
-                f"Failed to query external_resource for source {source_db!r}: {exc}"
+                f"Failed to get MAX(id): {exc}"
             ) from exc
 
-    def upsert_external_resources(self, records: list[ExternalResource]) -> int:
-        if not records:
-            return 0
+    def find_by_url(self, url: str) -> int | None:
         try:
-            params = [
-                (r.source_db, r.resource_id, r.hgnc_id, r.display_name, r.url)
-                for r in records
-            ]
             with self._conn.cursor() as cur:
-                cur.executemany(_UPSERT_RESOURCE, params)
-                return cur.rowcount
+                cur.execute(_FIND_BY_URL, (url,))
+                row = cur.fetchone()
+                return row[0] if row else None
         except Exception as exc:
             raise PersistenceError(
-                f"Failed to upsert {len(records)} external_resource records: {exc}"
+                f"Failed to find resource by URL {url!r}: {exc}"
             ) from exc
 
-    def delete_external_resources(self, source_db: str, resource_ids: list[str]) -> int:
-        if not resource_ids:
-            return 0
+    def update_name(self, ext_id: int, name: str) -> None:
         try:
             with self._conn.cursor() as cur:
-                cur.execute(_DELETE_RESOURCE, (source_db, resource_ids))
-                return cur.rowcount
+                cur.execute(_UPDATE_NAME, (name, ext_id))
         except Exception as exc:
             raise PersistenceError(
-                f"Failed to delete external_resource records for source {source_db!r}: {exc}"
+                f"Failed to update name for ext_id {ext_id}: {exc}"
             ) from exc
 
-    def upsert_family_links(self, links: list[FamilyExternalResourceLink]) -> int:
-        if not links:
-            return 0
+    def insert_resource(self, ext_id: int, name: str, url: str) -> None:
         try:
-            params = [(l.hgnc_id, l.resource_id, l.source_db) for l in links]
             with self._conn.cursor() as cur:
-                cur.executemany(_UPSERT_FAMILY_LINK, params)
-                return cur.rowcount
+                cur.execute(_INSERT_RESOURCE, (ext_id, name, url))
         except Exception as exc:
             raise PersistenceError(
-                f"Failed to upsert {len(links)} family links: {exc}"
+                f"Failed to insert resource {ext_id}: {exc}"
             ) from exc
 
-    def delete_family_links(self, source_db: str, resource_ids: list[str]) -> int:
-        if not resource_ids:
-            return 0
+    def delete_family_links(self, ext_id: int) -> None:
         try:
             with self._conn.cursor() as cur:
-                cur.execute(_DELETE_FAMILY_LINKS, (source_db, resource_ids))
-                return cur.rowcount
+                cur.execute(_DELETE_FAMILY_LINKS, (ext_id,))
         except Exception as exc:
             raise PersistenceError(
-                f"Failed to delete family links for source {source_db!r}: {exc}"
+                f"Failed to delete family links for ext_id {ext_id}: {exc}"
+            ) from exc
+
+    def insert_family_link(self, family_id: int, ext_id: int) -> None:
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(_INSERT_FAMILY_LINK, (family_id, ext_id))
+        except Exception as exc:
+            raise PersistenceError(
+                f"Failed to insert family link ({family_id}, {ext_id}): {exc}"
+            ) from exc
+
+    def get_all_flybase_urls(self) -> list[tuple[int, str]]:
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(_GET_ALL_FLYBASE)
+                return list(cur.fetchall())
+        except Exception as exc:
+            raise PersistenceError(
+                f"Failed to get FlyBase URLs: {exc}"
+            ) from exc
+
+    def delete_resource(self, ext_id: int) -> None:
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(_DELETE_RESOURCE, (ext_id,))
+        except Exception as exc:
+            raise PersistenceError(
+                f"Failed to delete resource {ext_id}: {exc}"
             ) from exc

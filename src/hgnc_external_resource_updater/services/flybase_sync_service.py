@@ -1,27 +1,28 @@
-"""FlyBase sync service orchestrating the fetch/parse/normalize/diff/apply lifecycle.
+"""FlyBase sync service orchestrating the fetch/parse/sync lifecycle.
 
-Coordinates the full sync flow: fetches the FlyBase feed, parses and
-normalizes records, diffs against current DB state, computes upsert/delete
-changesets, applies them, and emits structured summary metrics.
+Coordinates the full sync flow matching the Perl FlyBase.pm behaviour:
+fetches the FlyBase feed, decompresses, parses, syncs external_resource
+and family_has_external_resource tables, and cleans up retired groups.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 
-from hgnc_external_resource_updater.flybase_parser import normalize_batch
-from hgnc_external_resource_updater.models import ExternalResource
+from hgnc_external_resource_updater.flybase_parser import (
+    FlyBaseParser,
+    normalize_to_link,
+    normalize_to_resource,
+)
+from hgnc_external_resource_updater.models import FlyBaseRecord
 from hgnc_external_resource_updater.repositories.external_resource_repository import (
     ExternalResourceRepository,
 )
 
-if __name__ == "__main__":  # pragma: no cover
-    pass
-else:
-    from hgnc_external_resource_updater.flybase_client import FlyBaseClient
-    from hgnc_external_resource_updater.flybase_parser import FlyBaseParser
+_FBGG_PATTERN = re.compile(r"(FBgg\d+)")
 
 
 @dataclass
@@ -29,28 +30,28 @@ class SyncResult:
     """Structured summary of a FlyBase sync run.
 
     Attributes:
-        fetched: Total records fetched from the feed.
-        upserted: Records inserted or updated.
-        deleted: Records removed from the database.
-        unchanged: Records that matched existing data exactly.
+        fetched: Total records parsed from the feed.
+        upserted: External resources inserted or updated.
+        deleted: External resources removed (retired groups).
+        linked: Family links created.
     """
 
     fetched: int = 0
     upserted: int = 0
     deleted: int = 0
-    unchanged: int = 0
+    linked: int = 0
 
 
 class FlyBaseSyncService:
     """Orchestrate the FlyBase external resource sync lifecycle.
 
-    Accepts a FlyBaseClient, FlyBaseParser, and ExternalResourceRepository
-    via constructor injection. Computes deterministic changesets for upserts
-    and deletes, ensuring idempotency.
+    Accepts a repository via constructor injection. Implements the
+    same algorithm as the Perl FlyBase.pm: for each parsed record,
+    checks if the URL already exists, updates or inserts as needed,
+    re-creates the family link, and then removes retired FlyBase
+    groups no longer present in the feed.
 
     Args:
-        client: FlyBase feed client for fetching raw data.
-        parser: FlyBase parser for converting raw TSV to records.
         repository: Repository for querying and persisting external resources.
         logger: Logger for emitting structured metrics.
     """
@@ -59,27 +60,20 @@ class FlyBaseSyncService:
 
     def __init__(
         self,
-        client: FlyBaseClient,
-        parser: FlyBaseParser,
         repository: ExternalResourceRepository,
         logger: logging.Logger,
     ) -> None:
-        self._client = client
-        self._parser = parser
         self._repository = repository
         self._logger = logger
 
-    def run_sync(self) -> SyncResult:
+    def run_sync(self, records: list[FlyBaseRecord]) -> SyncResult:
         """Execute the full FlyBase sync lifecycle.
 
-        Returns:
-            A SyncResult with counts of fetched, upserted, deleted, and
-            unchanged records.
+        Args:
+            records: Parsed and validated FlyBase records.
 
-        Raises:
-            FetchError: If the feed cannot be fetched.
-            ParseError: If the feed cannot be parsed.
-            PersistenceError: If database operations fail.
+        Returns:
+            A SyncResult with counts of upserted, deleted, and linked records.
         """
         self._logger.info(
             "sync_start",
@@ -88,11 +82,7 @@ class FlyBaseSyncService:
 
         start = time.monotonic()
         try:
-            raw = self._client.fetch()
-            parsed = self._parser.parse(raw)
-            new_records = normalize_batch(parsed)
-            existing = self._repository.get_existing_by_source(self.SOURCE_DB)
-            result = self._compute_and_apply(new_records, existing)
+            result = self._sync_records(records)
         finally:
             elapsed = time.monotonic() - start
 
@@ -104,43 +94,86 @@ class FlyBaseSyncService:
                 "fetched": result.fetched,
                 "upserted": result.upserted,
                 "deleted": result.deleted,
-                "unchanged": result.unchanged,
+                "linked": result.linked,
                 "duration_seconds": round(elapsed, 3),
             },
         )
 
         return result
 
-    def _compute_and_apply(
-        self,
-        new_records: list[ExternalResource],
-        existing: list[ExternalResource],
-    ) -> SyncResult:
-        """Compute the changeset between new and existing records and apply it.
+    def _sync_records(self, records: list[FlyBaseRecord]) -> SyncResult:
+        """Sync records against the database, matching Perl behaviour.
 
         Args:
-            new_records: Normalized records from the latest feed.
-            existing: Current records from the database.
+            records: Parsed FlyBase records.
 
         Returns:
-            A SyncResult summarising the changes applied.
+            A SyncResult summarising the changes.
         """
-        new_ids = {r.resource_id for r in new_records}
-        existing_ids = {r.resource_id for r in existing}
+        new_fb_ids: set[str] = set()
+        upserted = 0
+        linked = 0
 
-        to_upsert = [r for r in new_records if r.resource_id not in existing_ids]
-        to_delete = [rid for rid in existing_ids if rid not in new_ids]
-        unchanged_count = len(new_ids & existing_ids)
+        next_id = self._repository.get_max_ext_id() + 1
 
-        if to_upsert:
-            self._repository.upsert_external_resources(to_upsert)
+        for record in records:
+            new_fb_ids.add(record.group_id)
+            resource = normalize_to_resource(record, 0)
+            link = normalize_to_link(record, 0)
 
-        if to_delete:
-            self._repository.delete_external_resources(self.SOURCE_DB, to_delete)
+            existing_id = self._repository.find_by_url(resource.url)
+            if existing_id is not None:
+                self._repository.update_name(existing_id, resource.name)
+                self._repository.delete_family_links(existing_id)
+                ext_id = existing_id
+            else:
+                ext_id = next_id
+                next_id += 1
+                self._repository.insert_resource(
+                    ext_id, resource.name, resource.url
+                )
+                upserted += 1
+
+            self._repository.insert_family_link(record.family_id, ext_id)
+            linked += 1
+
+        deleted = self._remove_retired_groups(new_fb_ids)
 
         return SyncResult(
-            fetched=len(new_records),
-            upserted=len(to_upsert),
-            deleted=len(to_delete),
-            unchanged=unchanged_count,
+            fetched=len(records),
+            upserted=upserted,
+            deleted=deleted,
+            linked=linked,
         )
+
+    def _remove_retired_groups(self, current_ids: set[str]) -> int:
+        """Remove FlyBase external resources no longer in the feed.
+
+        Args:
+            current_ids: Set of FBgg IDs present in the current feed.
+
+        Returns:
+            The number of retired groups deleted.
+        """
+        deleted = 0
+        flybase_rows = self._repository.get_all_flybase_urls()
+
+        for ext_id, url in flybase_rows:
+            match = _FBGG_PATTERN.search(url)
+            if match is None:
+                continue
+            fb_id = match.group(1)
+            if fb_id not in current_ids:
+                self._logger.info(
+                    "retire_flybase_group",
+                    extra={
+                        "event": "retire_flybase_group",
+                        "fb_id": fb_id,
+                        "ext_id": ext_id,
+                    },
+                )
+                self._repository.delete_family_links(ext_id)
+                self._repository.delete_resource(ext_id)
+                deleted += 1
+
+        return deleted
